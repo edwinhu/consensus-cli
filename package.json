@@ -1,6 +1,6 @@
 {
   "name": "consensus-cli",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "type": "module",
   "scripts": {
     "build": "bun build --compile src/index.ts --outfile consensus",
