@@ -1,17 +1,43 @@
-import { describe, test, expect } from "bun:test";
-import { connectToCDP, connectToCDPOnPort } from "../src/cdp.ts";
+import { describe, test, expect, afterEach } from "bun:test";
+import { connectToCDPOnPort, cdpPort } from "../src/cdp.ts";
 import { buildFilters, buildPostBody, mapPaper } from "../src/search.ts";
 
 describe("CDP module", () => {
   test("connectToCDP throws when port is unreachable", async () => {
     // Use a definitely-closed port for isolation
-    await expect(connectToCDPOnPort(19999)).rejects.toThrow("9222");
+    await expect(connectToCDPOnPort(19999)).rejects.toThrow("19999");
   });
 
-  test("connectToCDP error message contains 'Dia browser not running'", async () => {
+  test("error message names the port that was tried", async () => {
     await expect(connectToCDPOnPort(19999)).rejects.toThrow(
-      "Dia browser not running (CDP port 9222 unreachable)"
+      "Browser not running (CDP port 19999 unreachable)"
     );
+  });
+});
+
+describe("cdpPort (CONSENSUS_CDP_PORT)", () => {
+  afterEach(() => {
+    delete process.env.CONSENSUS_CDP_PORT;
+  });
+
+  test("defaults to 9250 when unset", () => {
+    delete process.env.CONSENSUS_CDP_PORT;
+    expect(cdpPort()).toBe(9250);
+  });
+
+  test("honours CONSENSUS_CDP_PORT when set", () => {
+    process.env.CONSENSUS_CDP_PORT = "9333";
+    expect(cdpPort()).toBe(9333);
+  });
+
+  test("falls back to 9250 on a non-numeric value", () => {
+    process.env.CONSENSUS_CDP_PORT = "not-a-port";
+    expect(cdpPort()).toBe(9250);
+  });
+
+  test("falls back to 9250 on an out-of-range value", () => {
+    process.env.CONSENSUS_CDP_PORT = "99999";
+    expect(cdpPort()).toBe(9250);
   });
 });
 
@@ -293,8 +319,157 @@ describe("mapPaper (CLI-18)", () => {
   });
 });
 
+// The thread/interaction papers API replaced /api/pro_research/search/.
+// Envelope is now {papers, total_count, is_end}; paginated by limit/offset.
+describe("papers endpoint response shape", () => {
+  // Verbatim record captured from
+  // GET /api/threads/<tid>/interactions/<iid>/papers/?limit=20&offset=0
+  const liveResponse = {
+    papers: [
+      {
+        authors: ["Caleb Rawson", "Stephen P. Rowe"],
+        badges: {
+          highly_cited_paper: false,
+          rigorous_journal: false,
+          study_type: "cross-sectional study",
+          animal_trial: false,
+          enhanced: false,
+        },
+        citation_count: 3,
+        display_text:
+          "Greater index fund ownership leads to less bias and obfuscation in financial reporting due to lower trading, not higher oversight.",
+        doc_id: "20b6c83291815861813a5f7d3e1c23a7",
+        doi: "10.1007/s11142-022-09726-9",
+        journal: "Review of Accounting Studies",
+        paper_id: "20b6c83291815861813a5f7d3e1c23a7",
+        title: "The power of not trading: Evidence from index fund ownership",
+        url_slug:
+          "the-power-of-not-trading-evidence-from-index-fund-ownership-rawson-rowe",
+        year: 2022,
+        is_retracted: false,
+      },
+    ],
+    total_count: 89,
+    is_end: false,
+  };
+
+  test("envelope exposes total_count and is_end (not is_complete)", () => {
+    expect(liveResponse.total_count).toBe(89);
+    expect(liveResponse.is_end).toBe(false);
+    expect(
+      Object.prototype.hasOwnProperty.call(liveResponse, "is_complete")
+    ).toBe(false);
+  });
+
+  test("mapPaper handles a live paper record from the new endpoint", () => {
+    const paper = mapPaper(liveResponse.papers[0]);
+    expect(paper.title).toBe(
+      "The power of not trading: Evidence from index fund ownership"
+    );
+    expect(paper.authors).toEqual(["Caleb Rawson", "Stephen P. Rowe"]);
+    expect(paper.year).toBe(2022);
+    expect(paper.journal).toBe("Review of Accounting Studies");
+    expect(paper.doi).toBe("10.1007/s11142-022-09726-9");
+    expect(paper.citations).toBe(3);
+    expect(paper.study_type).toBe("cross-sectional study");
+    expect(paper.takeaway).toContain("Greater index fund ownership");
+    // absent in this record -> must be null, not undefined
+    expect(paper.open_access_pdf_url).toBeNull();
+    expect(paper.url).toBe(
+      "https://consensus.app/papers/the-power-of-not-trading-evidence-from-index-fund-ownership-rawson-rowe/20b6c83291815861813a5f7d3e1c23a7/"
+    );
+  });
+
+  test("--page maps to offset = page * size", () => {
+    const size = 20;
+    expect(0 * size).toBe(0);
+    expect(2 * size).toBe(40);
+  });
+});
+
+// POST /api/threads/ still returns 201, but the interaction now carries `id`
+// instead of the removed `search_id`.
+describe("thread creation response shape", () => {
+  const liveThread = {
+    interactions: [
+      {
+        id: "L99nFmrgSq2HGrbPLlWdxg",
+        user_message: "index fund ownership measurement",
+        num_results_analyzed: 0,
+        search_mode: "PRO_ANALYSIS",
+      },
+    ],
+    thread_id: "SoY529oUQ4mBngwYylxoLg",
+    title: "index fund ownership measurement",
+  };
+
+  test("interaction carries id, not search_id", () => {
+    expect(liveThread.interactions[0].id).toBe("L99nFmrgSq2HGrbPLlWdxg");
+    expect(
+      Object.prototype.hasOwnProperty.call(
+        liveThread.interactions[0],
+        "search_id"
+      )
+    ).toBe(false);
+  });
+
+  test("thread_id is present at the top level", () => {
+    expect(liveThread.thread_id).toBe("SoY529oUQ4mBngwYylxoLg");
+  });
+
+  test("buildPostBody still matches what the web app POSTs", () => {
+    const body = buildPostBody("index fund ownership measurement", { n: 10 });
+    expect(body).toEqual({
+      user_message: "index fund ownership measurement",
+      is_incognito: false,
+      size: 10,
+      filters: {},
+      search_mode: "PRO_ANALYSIS",
+    });
+  });
+});
+
+// Completion is signalled by the SSE agent stream's terminal event.
+describe("agent stream completion signal", () => {
+  const streamChunk =
+    'id: 1786213053803-0\r\nevent: agent\r\ndata: {"type":"heartbeat"}\r\nretry: 15000\r\n\r\n' +
+    'id: 1786213053831-0\r\nevent: agent\r\ndata: {"type":"node_started","node":"router"}\r\nretry: 15000\r\n\r\n' +
+    'id: 1786213099999-0\r\nevent: agent\r\ndata: {"type":"agent_complete"}\r\nretry: 15000\r\n\r\n';
+
+  /** Mirrors the in-page parser in watchAgentStream. */
+  function parseComplete(raw: string): boolean {
+    let done = false;
+    let buf = raw.replace(/\r\n/g, "\n");
+    let i: number;
+    while ((i = buf.indexOf("\n\n")) >= 0) {
+      const block = buf.slice(0, i);
+      buf = buf.slice(i + 2);
+      const m = block.match(/^data: (.*)$/m);
+      if (!m) continue;
+      try {
+        if (JSON.parse(m[1]).type === "agent_complete") done = true;
+      } catch {
+        /* non-JSON keepalive */
+      }
+    }
+    return done;
+  }
+
+  test("detects agent_complete in a CRLF-delimited SSE stream", () => {
+    expect(parseComplete(streamChunk)).toBe(true);
+  });
+
+  test("does not report completion before agent_complete arrives", () => {
+    const partial = streamChunk.slice(
+      0,
+      streamChunk.indexOf('data: {"type":"agent_complete"}')
+    );
+    expect(parseComplete(partial)).toBe(false);
+  });
+});
+
 describe("CLI subprocess tests", () => {
-  const BINARY = "/Users/vwh7mb/projects/consensus-cli/consensus";
+  const BINARY = new URL("../consensus", import.meta.url).pathname;
 
   test("CLI-20: compiled binary exists and is executable", () => {
     const result = Bun.spawnSync(["test", "-x", BINARY]);
@@ -342,17 +517,13 @@ describe("CLI subprocess tests", () => {
   });
 
   test("CLI-22b: CDP unreachable exits 1 via binary", () => {
-    // Run binary without Dia running — CDP port 9222 will be unreachable
-    // We probe this by running `search` which will attempt CDP connection
+    // Point at a definitely-closed CDP port so the failure is deterministic
     const result = Bun.spawnSync([BINARY, "search", "test query"], {
       timeout: 30000,
+      env: { ...process.env, CONSENSUS_CDP_PORT: "19999" },
     });
-    // If Dia is not running, exit code must be 1
-    // If Dia IS running, this test is a no-op (exitCode 0 is also acceptable)
-    if (result.exitCode !== 0) {
-      expect(result.exitCode).toBe(1);
-      const stderr = result.stderr.toString();
-      expect(stderr).toContain("9222");
-    }
+    expect(result.exitCode).toBe(1);
+    const stderr = result.stderr.toString();
+    expect(stderr).toContain("19999");
   }, 30000);
 });

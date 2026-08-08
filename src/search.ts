@@ -194,14 +194,23 @@ export function mapPaper(paper: Record<string, unknown>): Paper {
   };
 }
 
+export interface Interaction {
+  threadId: string;
+  interactionId: string;
+}
+
+/** Give up on a search that never reaches agent_complete. */
+const SEARCH_TIMEOUT_MS = 300_000;
+
 /**
- * Start a search and return the searchId.
+ * Start a search and return the thread/interaction identifiers.
+ * POST /api/threads/ responds 201 with {thread_id, interactions: [{id, ...}]}.
  */
 async function startSearch(
   query: string,
   opts: SearchOptions,
   session: CDPSession
-): Promise<string> {
+): Promise<Interaction> {
   const postBody = buildPostBody(query, opts);
   const script = `
 (async function() {
@@ -210,33 +219,112 @@ async function startSearch(
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(${JSON.stringify(postBody)})
   });
+  if (!r.ok) {
+    throw new Error('POST /api/threads/ failed: HTTP ' + r.status);
+  }
   const d = await r.json();
-  return d.interactions[0].search_id;
+  const i = d.interactions && d.interactions[0];
+  if (!d.thread_id || !i || !i.id) {
+    throw new Error('Unexpected /api/threads/ response shape: ' + JSON.stringify(d).slice(0, 300));
+  }
+  return JSON.stringify({threadId: d.thread_id, interactionId: i.id});
 })()
 `;
-  return (await evaluateScript(session, script)) as string;
+  const result = (await evaluateScript(session, script)) as string;
+  return JSON.parse(result) as Interaction;
+}
+
+/**
+ * Start consuming the interaction's SSE agent stream inside the page, recording
+ * completion on `window.__consensusCli`. The stream is the only authoritative
+ * signal that the paper set is final: it ends with {"type":"agent_complete"}.
+ *
+ * This runs detached from the CDP call so subsequent polls can read the flag
+ * cheaply; the page context outlives each Runtime.evaluate WebSocket.
+ */
+async function watchAgentStream(
+  { threadId, interactionId }: Interaction,
+  session: CDPSession
+): Promise<void> {
+  const script = `
+(function() {
+  const st = {interactionId: ${JSON.stringify(interactionId)}, done: false, error: null};
+  window.__consensusCli = st;
+  (async function() {
+    try {
+      const r = await fetch('/api/threads/${threadId}/interactions/${interactionId}/agent/stream/');
+      if (!r.ok) { throw new Error('agent stream HTTP ' + r.status); }
+      const reader = r.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '';
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        buf += dec.decode(chunk.value, {stream: true}).replace(/\\r\\n/g, '\\n');
+        let i;
+        while ((i = buf.indexOf('\\n\\n')) >= 0) {
+          const block = buf.slice(0, i);
+          buf = buf.slice(i + 2);
+          const m = block.match(/^data: (.*)$/m);
+          if (!m) continue;
+          try {
+            if (JSON.parse(m[1]).type === 'agent_complete') { st.done = true; }
+          } catch (e) { /* non-JSON keepalive */ }
+        }
+      }
+    } catch (e) {
+      st.error = String(e);
+    }
+    // Stream close also means the agent stopped emitting.
+    st.done = true;
+  })();
+  return 'started';
+})()
+`;
+  await evaluateScript(session, script);
 }
 
 /**
  * Poll once for current search results.
+ * GET .../papers/ responds {papers, total_count, is_end} and paginates by
+ * limit/offset (the old page/size + is_complete endpoint no longer exists).
  */
 async function pollSearch(
-  searchId: string,
-  page: number,
-  size: number,
+  { threadId, interactionId }: Interaction,
+  offset: number,
+  limit: number,
   session: CDPSession
-): Promise<{ papers: Record<string, unknown>[]; isComplete: boolean }> {
+): Promise<{
+  papers: Record<string, unknown>[];
+  totalCount: number;
+  isEnd: boolean;
+  isComplete: boolean;
+  error: string | null;
+}> {
   const script = `
 (async function() {
-  const r = await fetch('/api/pro_research/search/${searchId}/?page=${page}&size=${size}');
+  const r = await fetch('/api/threads/${threadId}/interactions/${interactionId}/papers/?limit=${limit}&offset=${offset}');
+  if (!r.ok) {
+    throw new Error('GET papers failed: HTTP ' + r.status);
+  }
   const d = await r.json();
-  return JSON.stringify({papers: d.papers || [], isComplete: d.is_complete});
+  const st = window.__consensusCli || {};
+  return JSON.stringify({
+    papers: d.papers || [],
+    totalCount: d.total_count || 0,
+    isEnd: !!d.is_end,
+    isComplete: !!st.done,
+    error: st.error || null
+  });
 })()
 `;
   const result = (await evaluateScript(session, script)) as string;
   return JSON.parse(result) as {
     papers: Record<string, unknown>[];
+    totalCount: number;
+    isEnd: boolean;
     isComplete: boolean;
+    error: string | null;
   };
 }
 
@@ -252,15 +340,18 @@ export async function searchConsensus(
 ): Promise<Paper[]> {
   const page = opts.page ?? 0;
   const size = opts.n ?? 20;
+  const offset = page * size;
 
-  const searchId = await startSearch(query, opts, session);
+  const interaction = await startSearch(query, opts, session);
+  await watchAgentStream(interaction, session);
 
   let isComplete = false;
   let rawPapers: Record<string, unknown>[] = [];
+  const deadline = Date.now() + SEARCH_TIMEOUT_MS;
 
   while (!isComplete) {
     await new Promise((r) => setTimeout(r, 2000));
-    const result = await pollSearch(searchId, page, size, session);
+    const result = await pollSearch(interaction, offset, size, session);
     rawPapers = result.papers;
     isComplete = result.isComplete;
 
@@ -268,6 +359,15 @@ export async function searchConsensus(
       const papers = rawPapers.map(mapPaper);
       const line = JSON.stringify({ event: "poll", is_complete: isComplete, papers });
       process.stdout.write(line + "\n");
+    }
+
+    if (!isComplete && Date.now() > deadline) {
+      if (rawPapers.length === 0) {
+        throw new Error(
+          `Search timed out after ${SEARCH_TIMEOUT_MS / 1000}s with no results`
+        );
+      }
+      break;
     }
   }
 

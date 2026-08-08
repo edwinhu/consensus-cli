@@ -31,7 +31,8 @@ Options:
   -h, --help             Show this help
 
 Prerequisites:
-  Dia browser must be running with CDP enabled on port 9222.
+  A Chrome/Chromium logged in to consensus.app must be running with CDP enabled
+  on port 9250 (override with CONSENSUS_CDP_PORT).
 `;
 
 async function main(): Promise<void> {

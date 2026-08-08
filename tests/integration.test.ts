@@ -14,7 +14,7 @@ describe("consensus search CLI", () => {
         "--type",
         "rct",
       ],
-      { cwd: "/Users/vwh7mb/projects/consensus-cli" }
+      { cwd: new URL("..", import.meta.url).pathname }
     );
 
     expect(result.exitCode).toBe(0);
@@ -31,5 +31,5 @@ describe("consensus search CLI", () => {
     expect(paper.takeaway).toBeTruthy();
     expect(paper.year).toBeDefined();
     expect(paper.citations).toBeDefined();
-  }, 15000);
+  }, 120000);
 });

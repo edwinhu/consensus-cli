@@ -1,6 +1,7 @@
 /**
  * Chrome DevTools Protocol (CDP) module
- * Connects to Chrome/Dia browser via CDP WebSocket on port 9222.
+ * Connects to Chrome/Dia browser via CDP WebSocket.
+ * Port defaults to 9250; override with CONSENSUS_CDP_PORT.
  */
 
 export interface CDPSession {
@@ -36,7 +37,25 @@ interface CDPResponse {
   };
 }
 
-const CDP_PORT = 9222;
+const DEFAULT_CDP_PORT = 9250;
+
+/**
+ * The CDP port to use: CONSENSUS_CDP_PORT if set and valid, else 9250.
+ */
+export function cdpPort(): number {
+  const raw = process.env.CONSENSUS_CDP_PORT;
+  if (raw !== undefined) {
+    const parsed = parseInt(raw, 10);
+    if (!isNaN(parsed) && parsed > 0 && parsed < 65536) {
+      return parsed;
+    }
+  }
+  return DEFAULT_CDP_PORT;
+}
+
+function unreachableError(port: number): Error {
+  return new Error(`Browser not running (CDP port ${port} unreachable)`);
+}
 
 /**
  * Connect to CDP on a specific port (exported for testing).
@@ -52,16 +71,12 @@ export async function connectToCDPOnPort(port: number): Promise<CDPSession> {
     }
     targets = (await response.json()) as CDPTarget[];
   } catch {
-    throw new Error(
-      "Dia browser not running (CDP port 9222 unreachable)"
-    );
+    throw unreachableError(port);
   }
 
   const pageTargets = targets.filter((t) => t.type === "page");
   if (pageTargets.length === 0) {
-    throw new Error(
-      "Dia browser not running (CDP port 9222 unreachable)"
-    );
+    throw unreachableError(port);
   }
 
   const target = pageTargets[0];
@@ -73,10 +88,10 @@ export async function connectToCDPOnPort(port: number): Promise<CDPSession> {
 }
 
 /**
- * Connect to CDP on the default port (9222).
+ * Connect to CDP on the configured port.
  */
 export async function connectToCDP(): Promise<CDPSession> {
-  return connectToCDPOnPort(CDP_PORT);
+  return connectToCDPOnPort(cdpPort());
 }
 
 /**
@@ -87,14 +102,13 @@ export async function connectToCDP(): Promise<CDPSession> {
  */
 export async function ensureConsensusTab(session: CDPSession): Promise<CDPSession> {
   let targets: CDPTarget[];
+  const port = cdpPort();
 
   try {
-    const response = await fetch(`http://localhost:9222/json`);
+    const response = await fetch(`http://localhost:${port}/json`);
     targets = (await response.json()) as CDPTarget[];
   } catch {
-    throw new Error(
-      "Dia browser not running (CDP port 9222 unreachable)"
-    );
+    throw unreachableError(port);
   }
 
   const consensusTab = targets.find(
