@@ -4,7 +4,7 @@
  */
 
 import { parseArgs } from "util";
-import { connectToCDP, ensureConsensusTab } from "./cdp.ts";
+import { connectToCDP, ensureConsensusTab, AuthError } from "./cdp.ts";
 import { searchConsensus } from "./search.ts";
 import type { SearchOptions } from "./search.ts";
 
@@ -138,5 +138,6 @@ main().catch((err: unknown) => {
   process.stderr.write(
     `${err instanceof Error ? err.message : String(err)}\n`
   );
-  process.exit(1);
+  // AuthError carries a sysexits code so scripts can branch on the cause.
+  process.exit(err instanceof AuthError ? err.exitCode : 1);
 });

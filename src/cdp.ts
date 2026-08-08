@@ -37,24 +37,83 @@ interface CDPResponse {
   };
 }
 
+// Default targets the dedicated automation profile
+// (--user-data-dir=~/.config/chrome-cdp); port 9222 is a Chrome on the default
+// profile — the user's primary browser — and driving it steals focus.
 const DEFAULT_CDP_PORT = 9250;
 
+function isValidPort(p: number | undefined): p is number {
+  return typeof p === "number" && Number.isInteger(p) && p > 0 && p < 65536;
+}
+
 /**
- * The CDP port to use: CONSENSUS_CDP_PORT if set and valid, else 9250.
+ * Resolve the CDP port. Precedence: CONSENSUS_CDP_PORT > CDP_PORT > default.
+ * Invalid values at any level fall through to the next.
+ *
+ * CDP_PORT is the shared fallback: setting it configures every CLI in this
+ * family at once, while the tool-specific variable still wins.
  */
 export function cdpPort(): number {
-  const raw = process.env.CONSENSUS_CDP_PORT;
-  if (raw !== undefined) {
-    const parsed = parseInt(raw, 10);
-    if (!isNaN(parsed) && parsed > 0 && parsed < 65536) {
-      return parsed;
+  for (const name of ["CONSENSUS_CDP_PORT", "CDP_PORT"]) {
+    const raw = process.env[name];
+    if (raw !== undefined) {
+      const parsed = parseInt(raw, 10);
+      if (isValidPort(parsed)) {
+        return parsed;
+      }
     }
   }
   return DEFAULT_CDP_PORT;
 }
 
+/**
+ * Exit codes shared across this CLI family, following sysexits conventions so
+ * scripts and cron can branch on the cause without parsing stderr.
+ */
+export const EXIT = {
+  OK: 0,
+  UNAVAILABLE: 69,
+  NOPERM: 77,
+  TEMPFAIL: 75,
+} as const;
+
+/** An auth/environment failure carrying the exit code the CLI should use. */
+export class AuthError extends Error {
+  constructor(
+    message: string,
+    readonly exitCode: number
+  ) {
+    super(message);
+    this.name = "AuthError";
+  }
+}
+
+export function browserUnreachable(port: number): AuthError {
+  return new AuthError(
+    `Chrome not reachable on CDP port ${port}. Start Chrome with ` +
+      `--remote-debugging-port=${port} (automation profile: ~/.config/chrome-cdp), then retry.`,
+    EXIT.UNAVAILABLE
+  );
+}
+
+export function notSignedIn(service: string, port: number): AuthError {
+  return new AuthError(
+    `Not signed in to ${service} in the Chrome on CDP port ${port}. ` +
+      `Sign in there, then retry.`,
+    EXIT.NOPERM
+  );
+}
+
+export function blocked(service: string, port: number): AuthError {
+  return new AuthError(
+    `${service} returned a CAPTCHA or rate limit. Solve it in Chrome on CDP ` +
+      `port ${port}, then retry.`,
+    EXIT.TEMPFAIL
+  );
+}
+
 function unreachableError(port: number): Error {
-  return new Error(`Browser not running (CDP port ${port} unreachable)`);
+  return browserUnreachable(port);
 }
 
 /**

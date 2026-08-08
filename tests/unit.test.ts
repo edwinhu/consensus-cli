@@ -1,6 +1,19 @@
 import { describe, test, expect, afterEach } from "bun:test";
-import { connectToCDPOnPort, cdpPort } from "../src/cdp.ts";
-import { buildFilters, buildPostBody, mapPaper } from "../src/search.ts";
+import {
+  connectToCDPOnPort,
+  cdpPort,
+  AuthError,
+  EXIT,
+  browserUnreachable,
+  notSignedIn,
+  blocked,
+} from "../src/cdp.ts";
+import {
+  buildFilters,
+  buildPostBody,
+  mapPaper,
+  translateAuthError,
+} from "../src/search.ts";
 
 describe("CDP module", () => {
   test("connectToCDP throws when port is unreachable", async () => {
@@ -8,26 +21,46 @@ describe("CDP module", () => {
     await expect(connectToCDPOnPort(19999)).rejects.toThrow("19999");
   });
 
-  test("error message names the port that was tried", async () => {
+  test("unreachable CDP yields the shared AuthError taxonomy", async () => {
     await expect(connectToCDPOnPort(19999)).rejects.toThrow(
-      "Browser not running (CDP port 19999 unreachable)"
+      "Chrome not reachable on CDP port 19999"
     );
+    await expect(connectToCDPOnPort(19999)).rejects.toBeInstanceOf(AuthError);
   });
 });
 
-describe("cdpPort (CONSENSUS_CDP_PORT)", () => {
+// Shared convention across this CLI family (see google-scholar-cli/src/config.ts):
+// precedence is <TOOL>_CDP_PORT > CDP_PORT > 9250.
+describe("cdpPort precedence", () => {
   afterEach(() => {
     delete process.env.CONSENSUS_CDP_PORT;
+    delete process.env.CDP_PORT;
   });
 
-  test("defaults to 9250 when unset", () => {
-    delete process.env.CONSENSUS_CDP_PORT;
+  test("defaults to 9250 when nothing is set", () => {
     expect(cdpPort()).toBe(9250);
   });
 
   test("honours CONSENSUS_CDP_PORT when set", () => {
     process.env.CONSENSUS_CDP_PORT = "9333";
     expect(cdpPort()).toBe(9333);
+  });
+
+  test("honours the shared CDP_PORT fallback", () => {
+    process.env.CDP_PORT = "9444";
+    expect(cdpPort()).toBe(9444);
+  });
+
+  test("CONSENSUS_CDP_PORT wins over CDP_PORT", () => {
+    process.env.CONSENSUS_CDP_PORT = "9333";
+    process.env.CDP_PORT = "9444";
+    expect(cdpPort()).toBe(9333);
+  });
+
+  test("an invalid tool-specific value falls through to CDP_PORT", () => {
+    process.env.CONSENSUS_CDP_PORT = "not-a-port";
+    process.env.CDP_PORT = "9444";
+    expect(cdpPort()).toBe(9444);
   });
 
   test("falls back to 9250 on a non-numeric value", () => {
@@ -38,6 +71,59 @@ describe("cdpPort (CONSENSUS_CDP_PORT)", () => {
   test("falls back to 9250 on an out-of-range value", () => {
     process.env.CONSENSUS_CDP_PORT = "99999";
     expect(cdpPort()).toBe(9250);
+  });
+});
+
+describe("auth error taxonomy", () => {
+  test("browserUnreachable is EXIT.UNAVAILABLE (69) and names the flag", () => {
+    const e = browserUnreachable(9250);
+    expect(e).toBeInstanceOf(AuthError);
+    expect(e.exitCode).toBe(EXIT.UNAVAILABLE);
+    expect(e.exitCode).toBe(69);
+    expect(e.message).toContain("--remote-debugging-port=9250");
+  });
+
+  test("notSignedIn is EXIT.NOPERM (77) and names service and port", () => {
+    const e = notSignedIn("consensus.app", 9250);
+    expect(e.exitCode).toBe(EXIT.NOPERM);
+    expect(e.exitCode).toBe(77);
+    expect(e.message).toContain("consensus.app");
+    expect(e.message).toContain("9250");
+  });
+
+  test("blocked is EXIT.TEMPFAIL (75)", () => {
+    const e = blocked("consensus.app", 9250);
+    expect(e.exitCode).toBe(EXIT.TEMPFAIL);
+    expect(e.exitCode).toBe(75);
+    expect(e.message).toMatch(/CAPTCHA|rate limit/);
+  });
+});
+
+// In-page exceptions cross the CDP boundary as strings, so auth failures are
+// signalled with sentinels and translated back on the Node side.
+describe("translateAuthError", () => {
+  test("maps the signed-out sentinel to a 77", () => {
+    const out = translateAuthError(
+      new Error("Script exception: Error: CONSENSUS_NOT_SIGNED_IN\n  at <anonymous>")
+    );
+    expect(out).toBeInstanceOf(AuthError);
+    expect((out as AuthError).exitCode).toBe(77);
+    expect((out as AuthError).message).toContain("Not signed in to consensus.app");
+  });
+
+  test("maps the blocked sentinel to a 75", () => {
+    const out = translateAuthError(new Error("Script exception: Error: CONSENSUS_BLOCKED"));
+    expect((out as AuthError).exitCode).toBe(75);
+  });
+
+  test("passes unrelated errors through untouched", () => {
+    const original = new Error("Unexpected token '<'");
+    expect(translateAuthError(original)).toBe(original);
+  });
+
+  test("a genuine parse failure is NOT reported as an auth problem", () => {
+    const out = translateAuthError(new Error("SyntaxError: Unexpected token '<'"));
+    expect(out).not.toBeInstanceOf(AuthError);
   });
 });
 
@@ -522,7 +608,8 @@ describe("CLI subprocess tests", () => {
       timeout: 30000,
       env: { ...process.env, CONSENSUS_CDP_PORT: "19999" },
     });
-    expect(result.exitCode).toBe(1);
+    // CDP unreachable is EXIT.UNAVAILABLE, not a generic 1
+    expect(result.exitCode).toBe(69);
     const stderr = result.stderr.toString();
     expect(stderr).toContain("19999");
   }, 30000);

@@ -4,7 +4,36 @@
  */
 
 import type { CDPSession } from "./cdp.ts";
-import { evaluateScript } from "./cdp.ts";
+import { evaluateScript, cdpPort, notSignedIn, blocked } from "./cdp.ts";
+
+const SERVICE = "consensus.app";
+
+/**
+ * In-page code signals auth failures with sentinel messages, since exceptions
+ * cross the CDP boundary as strings. Translate them into the shared taxonomy.
+ */
+export function translateAuthError(err: unknown): unknown {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (msg.includes("CONSENSUS_NOT_SIGNED_IN")) {
+    return notSignedIn(SERVICE, cdpPort());
+  }
+  if (msg.includes("CONSENSUS_BLOCKED")) {
+    return blocked(SERVICE, cdpPort());
+  }
+  return err;
+}
+
+/** Run a script in the page, mapping sentinel auth failures to AuthError. */
+async function evaluateChecked(
+  session: CDPSession,
+  script: string
+): Promise<unknown> {
+  try {
+    return await evaluateScript(session, script);
+  } catch (err) {
+    throw translateAuthError(err);
+  }
+}
 
 export interface SearchOptions {
   n?: number;
@@ -219,6 +248,17 @@ async function startSearch(
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(${JSON.stringify(postBody)})
   });
+  if (r.status === 401 || r.status === 403) {
+    throw new Error('CONSENSUS_NOT_SIGNED_IN');
+  }
+  if (r.status === 429) {
+    throw new Error('CONSENSUS_BLOCKED');
+  }
+  // A signed-out session redirects to the SPA shell, which is HTML, not JSON.
+  const ct = r.headers.get('content-type') || '';
+  if (!ct.includes('application/json')) {
+    throw new Error('CONSENSUS_NOT_SIGNED_IN');
+  }
   if (!r.ok) {
     throw new Error('POST /api/threads/ failed: HTTP ' + r.status);
   }
@@ -230,7 +270,7 @@ async function startSearch(
   return JSON.stringify({threadId: d.thread_id, interactionId: i.id});
 })()
 `;
-  const result = (await evaluateScript(session, script)) as string;
+  const result = (await evaluateChecked(session, script)) as string;
   return JSON.parse(result) as Interaction;
 }
 
@@ -318,7 +358,7 @@ async function pollSearch(
   });
 })()
 `;
-  const result = (await evaluateScript(session, script)) as string;
+  const result = (await evaluateChecked(session, script)) as string;
   return JSON.parse(result) as {
     papers: Record<string, unknown>[];
     totalCount: number;
