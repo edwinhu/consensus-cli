@@ -10,6 +10,7 @@ import {
 } from "../src/cdp.ts";
 import {
   buildFilters,
+  parseNameListFile,
   buildPostBody,
   mapPaper,
   translateAuthError,
@@ -201,6 +202,39 @@ describe("buildFilters", () => {
   test("maps --country to country string", () => {
     const filters = buildFilters({ country: "US,UK" });
     expect(filters.country).toBe("US,UK");
+  });
+
+  // The web app posts journal_name as a JSON-encoded array and publisher_name
+  // as a comma-joined string. Those two shapes are not interchangeable.
+  test("maps --journal to a JSON-encoded array string", () => {
+    const filters = buildFilters({
+      journals: ["Journal of Finance", "Journal of Financial Economics"],
+    });
+    expect(filters.journal_name).toBe(
+      '["Journal of Finance","Journal of Financial Economics"]'
+    );
+  });
+
+  test("journal names containing commas survive the round trip", () => {
+    const filters = buildFilters({ journals: ["Cell death, differentiation"] });
+    expect(JSON.parse(filters.journal_name as string)).toEqual([
+      "Cell death, differentiation",
+    ]);
+  });
+
+  test("omits journal_name when no journals are given", () => {
+    expect(buildFilters({ journals: [] }).journal_name).toBeUndefined();
+    expect(buildFilters({}).journal_name).toBeUndefined();
+  });
+
+  test("maps --publisher to a comma-joined string", () => {
+    const filters = buildFilters({ publishers: ["Elsevier", "Wiley"] });
+    expect(filters.publisher_name).toBe("Elsevier,Wiley");
+  });
+
+  test("omits publisher_name when no publishers are given", () => {
+    expect(buildFilters({ publishers: [] }).publisher_name).toBeUndefined();
+    expect(buildFilters({}).publisher_name).toBeUndefined();
   });
 
   test("maps --years range to year_min and year_max", () => {
@@ -613,4 +647,32 @@ describe("CLI subprocess tests", () => {
     const stderr = result.stderr.toString();
     expect(stderr).toContain("19999");
   }, 30000);
+});
+
+describe("parseNameListFile", () => {
+  test("keeps one name per line and drops blanks and comments", () => {
+    const text = [
+      "# top finance",
+      "Journal of Finance",
+      "",
+      "  Review of Financial Studies  ",
+      "# accounting",
+      "Journal of Accounting and Economics",
+    ].join("\n");
+    expect(parseNameListFile(text)).toEqual([
+      "Journal of Finance",
+      "Review of Financial Studies",
+      "Journal of Accounting and Economics",
+    ]);
+  });
+
+  test("does not split on commas inside a journal name", () => {
+    expect(parseNameListFile("Cell death, differentiation\n")).toEqual([
+      "Cell death, differentiation",
+    ]);
+  });
+
+  test("strips a leading BOM", () => {
+    expect(parseNameListFile("\ufeffNature")).toEqual(["Nature"]);
+  });
 });

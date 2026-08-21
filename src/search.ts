@@ -49,6 +49,8 @@ export interface SearchOptions {
   duration?: string;
   domain?: string;
   country?: string;
+  journals?: string[];
+  publishers?: string[];
   controlled?: boolean;
   page?: number;
   sort?: string;
@@ -70,6 +72,8 @@ export interface Filters {
   duration_unit?: string;
   domain?: string;
   country?: string;
+  journal_name?: string;
+  publisher_name?: string;
 }
 
 export interface PostBody {
@@ -177,6 +181,17 @@ export function buildFilters(opts: SearchOptions): Filters {
 
   if (opts.country !== undefined) {
     filters.country = opts.country;
+  }
+
+  // journal_name is a JSON-encoded array of exact journal names; publisher_name
+  // is a comma-joined list. Both shapes are what the web app posts — see
+  // `consensus journals` / `consensus publishers` for the accepted values.
+  if (opts.journals !== undefined && opts.journals.length > 0) {
+    filters.journal_name = JSON.stringify(opts.journals);
+  }
+
+  if (opts.publishers !== undefined && opts.publishers.length > 0) {
+    filters.publisher_name = opts.publishers.join(",");
   }
 
   // NOTE: opts.page is NOT included in filters (it's a GET query param)
@@ -418,4 +433,69 @@ export async function searchConsensus(
   }
 
   return papers;
+}
+
+export interface JournalSuggestion {
+  name: string;
+}
+
+export interface PublisherOption {
+  value: string;
+  displayName: string;
+}
+
+/**
+ * Look up journal names accepted by the --journal filter.
+ * An empty query returns the popular/default set the web app shows.
+ */
+export async function suggestJournals(
+  query: string,
+  session: CDPSession
+): Promise<JournalSuggestion[]> {
+  const script = `
+(async function() {
+  const r = await fetch('/api/journals/autocomplete/?query=' + encodeURIComponent(${JSON.stringify(query)}));
+  if (r.status === 401 || r.status === 403) { throw new Error('CONSENSUS_NOT_SIGNED_IN'); }
+  if (r.status === 429) { throw new Error('CONSENSUS_BLOCKED'); }
+  const ct = r.headers.get('content-type') || '';
+  if (!ct.includes('application/json')) { throw new Error('CONSENSUS_NOT_SIGNED_IN'); }
+  if (!r.ok) { throw new Error('GET journals autocomplete failed: HTTP ' + r.status); }
+  return JSON.stringify((await r.json()).suggestions || []);
+})()
+`;
+  const result = (await evaluateChecked(session, script)) as string;
+  return JSON.parse(result) as JournalSuggestion[];
+}
+
+/** List the publisher values accepted by the --publisher filter. */
+export async function listPublishers(
+  session: CDPSession
+): Promise<PublisherOption[]> {
+  const script = `
+(async function() {
+  const r = await fetch('/api/publishers/filter_options/');
+  if (r.status === 401 || r.status === 403) { throw new Error('CONSENSUS_NOT_SIGNED_IN'); }
+  if (r.status === 429) { throw new Error('CONSENSUS_BLOCKED'); }
+  const ct = r.headers.get('content-type') || '';
+  if (!ct.includes('application/json')) { throw new Error('CONSENSUS_NOT_SIGNED_IN'); }
+  if (!r.ok) { throw new Error('GET publisher filter options failed: HTTP ' + r.status); }
+  return JSON.stringify((await r.json()).publishers || []);
+})()
+`;
+  const result = (await evaluateChecked(session, script)) as string;
+  return JSON.parse(result) as PublisherOption[];
+}
+
+/**
+ * Parse a newline-delimited journal list file. Blank lines and `#` comments are
+ * skipped, so the file can double as a readable, annotated list.
+ *
+ * Names are NOT comma-split: real journal names contain commas
+ * ("Cell death, differentiation"), so one name per line is the only safe rule.
+ */
+export function parseNameListFile(text: string): string[] {
+  return text
+    .split("\n")
+    .map((line) => line.replace(/^﻿/, "").trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"));
 }

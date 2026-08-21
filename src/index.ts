@@ -5,10 +5,17 @@
 
 import { parseArgs } from "util";
 import { connectToCDP, ensureConsensusTab, AuthError } from "./cdp.ts";
-import { searchConsensus } from "./search.ts";
+import {
+  searchConsensus,
+  suggestJournals,
+  listPublishers,
+  parseNameListFile,
+} from "./search.ts";
 import type { SearchOptions } from "./search.ts";
 
 const HELP_TEXT = `Usage: consensus search "<query>" [options]
+       consensus journals [<query>]
+       consensus publishers
 
 Options:
   --n <int>              Number of results (default: 20, max: 100)
@@ -24,11 +31,22 @@ Options:
   --duration <value>     Minimum duration: 6mo, 1yr, 30d, 2wk
   --domain <csv>         Fields of study: Medicine,Chemistry,...
   --country <csv>        Country filter: USA,UK,...
+  --journal <name>       Restrict to a journal; repeat for more than one.
+                         Names must match exactly — see "consensus journals".
+  --journals-file <path> Read journal names from a file, one per line
+                         (blank lines and # comments ignored)
+  --publisher <name>     Restrict to a publisher; repeat for more than one.
+                         See "consensus publishers" for accepted values.
   --controlled           Controlled studies only
   --page <int>           Page number (default: 0)
   --sort <field>         Sort results: citations (client-side, desc)
   --stream               Emit NDJSON poll events as results arrive
   -h, --help             Show this help
+
+Subcommands:
+  journals [<query>]     List journal names accepted by --journal. With no
+                         query, lists the popular default set.
+  publishers             List publisher values accepted by --publisher.
 
 Prerequisites:
   A Chrome/Chromium logged in to consensus.app must be running with CDP enabled
@@ -56,6 +74,9 @@ async function main(): Promise<void> {
         duration: { type: "string" },
         domain: { type: "string" },
         country: { type: "string" },
+        journal: { type: "string", multiple: true },
+        "journals-file": { type: "string" },
+        publisher: { type: "string", multiple: true },
         controlled: { type: "boolean", default: false },
         page: { type: "string", default: "0" },
         sort: { type: "string" },
@@ -81,13 +102,24 @@ async function main(): Promise<void> {
   }
 
   const subcommand = positionals[0];
-  if (subcommand !== "search") {
+  const SUBCOMMANDS = ["search", "journals", "publishers"];
+  if (subcommand === undefined || !SUBCOMMANDS.includes(subcommand)) {
     const msg =
       subcommand === undefined
         ? "Error: subcommand required. Usage: consensus search \"<query>\" [options]"
-        : `Error: unknown subcommand "${subcommand}". Did you mean "search"?`;
+        : `Error: unknown subcommand "${subcommand}". Expected one of: ${SUBCOMMANDS.join(", ")}`;
     process.stderr.write(`${msg}\n`);
     process.exit(1);
+  }
+
+  if (subcommand === "journals" || subcommand === "publishers") {
+    const session = await ensureConsensusTab(await connectToCDP());
+    const result =
+      subcommand === "journals"
+        ? await suggestJournals(positionals[1] ?? "", session)
+        : await listPublishers(session);
+    process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+    return;
   }
 
   const query = positionals[1];
@@ -102,6 +134,21 @@ async function main(): Promise<void> {
   if (n < 1 || n > 100) {
     process.stderr.write("Error: --n must be between 1 and 100\n");
     process.exit(1);
+  }
+
+  const journals = [...((values.journal as string[] | undefined) ?? [])];
+  const journalsFile = values["journals-file"] as string | undefined;
+  if (journalsFile !== undefined) {
+    let text: string;
+    try {
+      text = await Bun.file(journalsFile).text();
+    } catch {
+      process.stderr.write(
+        `Error: cannot read --journals-file ${journalsFile}\n`
+      );
+      process.exit(1);
+    }
+    journals.push(...parseNameListFile(text));
   }
 
   const opts: SearchOptions = {
@@ -122,6 +169,8 @@ async function main(): Promise<void> {
     duration: values.duration as string | undefined,
     domain: values.domain as string | undefined,
     country: values.country as string | undefined,
+    journals: journals.length > 0 ? journals : undefined,
+    publishers: values.publisher as string[] | undefined,
     controlled: values.controlled as boolean,
     page: values.page ? parseInt(values.page as string, 10) : 0,
     sort: values.sort as string | undefined,
